@@ -1,0 +1,104 @@
+import { Router, Request, Response } from "express";
+import { FeedItem } from "../models/FeedItem";
+import { NextFunction } from "connect";
+import * as jwt from "jsonwebtoken";
+import * as AWS from "../../../../aws";
+import * as c from "../../../../config/config";
+
+const router: Router = Router();
+
+export function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  if (!req.headers || !req.headers.authorization) {
+    res.status(401).send({ message: "No authorization headers." });
+    return; // Ensure that you return here to stop further execution
+  }
+
+  const tokenBearer = req.headers.authorization.split(" ");
+  if (tokenBearer.length !== 2) {
+    res.status(401).send({ message: "Malformed token." });
+    return;
+  }
+
+  const token = tokenBearer[1];
+  jwt.verify(token, c.config.jwt.secret, (err, decoded) => {
+    if (err) {
+      res.status(500).send({ auth: false, message: "Failed to authenticate." });
+      return;
+    }
+    next(); // Call `next()` only if verification is successful
+  });
+}
+
+// Get all feed items
+router.get("/", async (req: Request, res: Response) => {
+  const items = await FeedItem.findAndCountAll({ order: [["id", "DESC"]] });
+  items.rows.map((item) => {
+    if (item.url) {
+      item.url = AWS.getGetSignedUrl(item.url);
+    }
+  });
+  res.send(items);
+});
+
+// Get a feed resource
+router.get("/:id", async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const item = await FeedItem.findByPk(id);
+  res.send(item);
+});
+
+// Get a signed url to put a new item in the bucket
+router.get(
+  "/signed-url/:fileName",
+  requireAuth,
+  async (req: Request, res: Response) => {
+    const { fileName } = req.params;
+    const url = AWS.getPutSignedUrl(fileName);
+    res.status(201).send({ url: url });
+  }
+);
+
+// Create feed with metadata
+router.post(
+  "/",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    // Ensure return type is Promise<void>
+    try {
+      const caption = req.body.caption;
+      const fileName = req.body.url; // same as S3 key name
+
+      if (!caption) {
+        res.status(400).send({ message: "Caption is required or malformed." });
+        return;
+      }
+
+      if (!fileName) {
+        res.status(400).send({ message: "File url is required." });
+        return;
+      }
+
+      const item = new FeedItem({
+        caption: caption,
+        url: fileName,
+      });
+
+      const savedItem = await item.save();
+
+      // Get signed URL after saving the item
+      savedItem.url = AWS.getGetSignedUrl(savedItem.url);
+
+      // Send the response
+      res.status(201).send(savedItem);
+    } catch (error) {
+      // Catch and handle any errors
+      res.status(500).send({ message: "Error saving item.", error });
+    }
+  }
+);
+
+export const FeedRouter: Router = router;
